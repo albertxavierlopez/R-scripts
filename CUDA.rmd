@@ -1,0 +1,285 @@
+---
+title: "GPU Programming"
+author: "Alejandro Encalado Masia and Albert Xavier Lopez Barrantes"
+date: "Parallel programming, 22th January 2019"
+output: pdf_document
+fontsize: 12pt
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1. Introduction
+
+Until now we have been working on paralellization using the capabilities of the CPU, however it is not the only device in a standard computer capable to perform mathematical operations. For this assignment, we are going to use NVIDIA GPU to parallelize our processes. In order to perform this, we are going to use some pragmas comming from CUDA libraries, which will tell to the compiler which parts of the code should go to the GPU instead of going to the CPU.
+
+   
+# 2. OpenACC on the Jacobi Method Algorithm.
+
+Our first interaction with GPU parallelization will be testing the well known Jacobi Algorithm. The first task will be a comparison of performance between a CPU execution against a GPU using different matrix dimensions.
+   
+First of all we are asked to perform the CPU accelerated version using a benchmark matrix size of $n=1000$ and $n=4000$. 
+   
+```{r echo=FALSE, fig.align = "center", message=FALSE, warning=FALSE}
+library(tidyverse)
+library(ggplot2)
+
+
+CPU_GPU<-c("CPU","GPU","CPU","GPU")
+Matrix_Dimension<-c(1000,1000,4000,4000)
+Iterations<-c(5000,5000,5000,5000)
+#Traces<-c(250,250,50,50)
+Elapsed_Time<-c(0.446201, 1.45692,33.157,3.4)
+Error<-c(0.000997877, 0.000997877,1.26637,1.26637) 
+Convergence<-c(4448, 4448,5000,5000)
+
+first_opt<-cbind(CPU_GPU,Matrix_Dimension,Iterations,Elapsed_Time,Error)
+names(first_opt) <- c("CPU/GPU","n size", "iterations", "execution time (s)", "error")
+knitr::kable(first_opt)
+```
+   
+
+Results for these first exepriments where quite expected, since increasing the complexity by a factor of x4 the execution time increased by a factor of x75. In the other side, the accelerated version by GPU using the OpenACC implementation for a matrix size of $n=1000$ spent three times more the time used by the CPU version. That was a bit surprising because even we know it's a small size problem we expected to get at least a little improvement in executing times. Such a poor performance can be analyzed using the Nvidia graphics, and we can see there is so much time spent initiallizing and closing CUDA in comparison to the time spent in executing the body of the program.
+
+```{r echo=FALSE,out.width = "80%", fig.align = "center"}
+setwd("C:/Users/Albert/Desktop/Data Science/Paralel programming")
+#setwd("/home/faraday/HD-linux/ownCloud/Documents/Master/PP/CUDA/Markdown")
+knitr::include_graphics('1000.png')
+```
+   
+It seems like in low complex computation problems, there is more time opening and closing CUDA module and there is no benefit in using the a GPU parallelization of the algorithm. However, when increasing the complexity by a factor of x4, time spent is reduced by a magnitude we have never seen neither using OpenMP or MPI parallelizations. Such an improvement in execution times when increasing the complexity of the problem is not that much clear when making the visualizations. In fact, the complexity magnitude of this algorithm even with a matrix size of $n=4000$ is not enough to really appreaciate the capacity of GPU programming. 
+   
+```{r echo=FALSE,out.width = "80%", fig.align = "center"}
+knitr::include_graphics('4000.png')
+```
+
+
+# 3. OpenACC on the Heat transfer.
+
+In this part we have applied the same methodology as the last one but on the Heat transfer problem. The script provided simulates the heat transfer along a metal bar with the temperature at the boundary points being fixed. This phenomena can be modeled with the following partial diferential equation:
+
+$$ \alpha \dfrac{\delta ^2T_{(x,t)}}{\delta ^2 x} = \dfrac{\delta T_{(x,t)}}{\delta t} $$
+    
+This expression is known as Fourier law, and its parameters are temperature ($T$), position ($x$), time ($t$) and thermal diffusivity ($\alpha$), which deppends on the material. This PDE can be computed analitically using finite differences method, this method approximates the derivative of a function in the following way:
+   
+$$\dfrac{\delta y_{(a)}}{\delta t} \simeq \dfrac{y_{(a+h)}-y_{(a)}}{h}$$
+    
+With all of this, the way to solve the heat transfer problem is using an array of N elements which represents the points of the metal bar, so for a single point,the next time step can be computed as a function of its neighbours and itself. This new element is an stencil that uses a value U[x] and its two neighbors.
+As we have an stencil, we can parallelize the whole process as we did with the Jacobi Method Algorithm.
+   
+## Implementation of OpenACC.
+   
+As it has been done in the previous section, we have implemented some pragmas in the baseline code in order to tell to the GPU to perform the computations in parallel. In the following pharagraphs, we will explain what we have been doing with the code and what does it mean all these implementations.
+   
+```{}
+L2 = (1.0f-2.0f*L);
+#pragma acc data copyin(U1[:(N+2)],U2[:(N+2)])   
+for (t=1; t<=T; t++){  // loop on time
+```
+   
+Here we introduced the first pragma clause, which tells the GPU to copy arrays U1 and U2 from the host to the device in order to prepare the parallelisation process.
+    
+```{}
+if ((t&1) == 1){ // t is odd
+	  #pragma acc kernels loop independent
+      for (x=1; x<=N; x++)  // loop on 1D bar
+        U2[x] = L2*U1[x] + L*U1[x+1] + L*U1[x-1];}
+    else{            // t is even
+	  #pragma acc kernels loop independent
+      for (x=1; x<=N; x++)  // loop on 1D bar
+        U1[x] = L2*U2[x] + L*U2[x+1] + L*U2[x-1];}
+```
+     
+Then the time loop starts, when t is odd, we tell to the compiler to parallelize the for loop in order to compute the stencil. The same happens when t is even. Notice that this two processes cannot be computed in parallel since we need the information stored in U2 before updating the new U1 array.
+   
+```{}
+  if ((t&1) == 1)
+  {
+    if (N<=100)
+      printV(U1,N);
+    else
+    { 
+        S = 0.0;
+	#pragma acc kernels loop independent   
+      for ( x=0; x<=N+1; x++) // compute checksum of final state 
+         S = S + U1[x];
+      //printf("\nCheckSum = %1.10e\n", S);
+    }
+  } 
+  else
+  {
+    if (N<=100)
+      printV(U2,N);
+    else
+    { 
+      S=0.0;
+	#pragma acc kernels loop independent 
+      for ( x=0; x<=N+1; x++) // compute checksum of final state 
+         S = S + U2[x];
+      //printf("\nCheckSum = %1.10e\n", S);
+    }
+
+
+```
+   
+Finally we tell the compiler the same as before but, to compute the checksum of both cases, when t is odd and even. This pragma implies an implicit reduction of S, which is desirable for our porpuses.
+   
+Once this implementations have been done, we can compile and perform our analysis over CPU and GPU.
+
+## Performance analysis with L fixed.
+
+Here we have our performances fixing $L=0.001234$ and $N=10^7$ to compare execution times with different Times sizes in CPU vs GPU:
+
+```{r echo=FALSE, fig.align = "center", message=FALSE, warning=FALSE}
+
+#Version with N fixed 
+
+N_fix <-c(1e7,1e7,1e7,1e7,1e7)
+L <-c(0.001234,0.001234,0.001234,0.001234,0.001234)
+T_step_Nfix <-c(1000,2000,4000,8000,16000)
+
+Elapsed_Time_CPU_Nfix<-c(10.59,21.12,42.62,85.22,169.13)
+S_Checksum_CPU_Nfix <-c(2.9185,3.4178,4.1387,5.1678,6.6300)
+Elapsed_Time_GPU_Nfix<-c(1.25,1.99,3.40,6.26,12.01)
+S_Checksum_GPU_Nfix <-c(2.9185,3.4178,4.1387,5.1678,6.6300)
+ratio_CPU_GPU_Nfix <- Elapsed_Time_CPU_Nfix/Elapsed_Time_GPU_Nfix
+
+second_opt<-cbind(T_step_Nfix,Elapsed_Time_CPU_Nfix,Elapsed_Time_GPU_Nfix,ratio_CPU_GPU_Nfix,S_Checksum_CPU_Nfix,S_Checksum_GPU_Nfix)
+colnames(second_opt) <- c("T","CPU Time (s)", "GPU Time (s)","Ratio GPU vs CPU", "Checksum CPU","Checksum GPU")
+knitr::kable(second_opt)
+
+```
+
+And performances fixing the $T=1000$ and $L=0.001234$ to compare execution times between CPU and GPU changing the size of N.
+
+```{r echo=FALSE, fig.align = "center", message=FALSE, warning=FALSE}
+
+#Version with T fixed 
+
+N_Tfix <-c(1e7,2*1e7,4*1e7,8*1e7,16*1e7)
+L_Tfix <-c(0.001234,0.001234,0.001234,0.001234,0.001234)
+T_step <-c(2000,2000,2000,2000,2000)
+
+Elapsed_Time_CPU_Tfix<-c(21.12,42.36,84.59,167.69,332.71)
+S_Checksum_CPU_Tfix <-c(3.4178,3.4178,3.4178,3.4178,3.4178)
+
+Elapsed_Time_GPU_Tfix<-c(1.99,3.07,5.06,9.37,18.00)
+S_Checksum_GPU_Tfix <-c(3.4178,3.4178,3.4178,3.4178,3.4178)
+ratio_CPU_GPU_Tfix <- Elapsed_Time_CPU_Tfix/Elapsed_Time_GPU_Tfix
+
+third_opt<-cbind(N_Tfix,Elapsed_Time_CPU_Tfix,Elapsed_Time_GPU_Tfix,ratio_CPU_GPU_Tfix,S_Checksum_CPU_Tfix,S_Checksum_GPU_Tfix)
+colnames(third_opt) <- c("N","CPU Time(s)", "GPU Time(s)","Ratio GPU/CPU", "Checksum CPU","Checksum GPU")
+knitr::kable(third_opt)
+
+```
+   
+The best option to realise time performances from the executions above is with bar plots with all performance times and comparing them when changing parameters:
+   
+```{r echo=FALSE, out.width = "80%", fig.align = "center", message=FALSE, warning=FALSE}
+library(ggplot2)
+library(tidyverse)
+library(reshape2)
+
+df1 <- data.frame(log(Elapsed_Time_CPU_Nfix), log(Elapsed_Time_GPU_Nfix), T_step_Nfix)
+df2 <- melt(df1, id.vars='T_step_Nfix')
+
+ggplot(df2, aes(x=log2(T_step_Nfix), y=value, fill=variable)) +
+    geom_bar(stat='identity', position='dodge')+
+    xlab("Log(N) in base 2") + 
+    ylab("log Time elapsed") + 
+    ggtitle("Execution times CPU vs GPU N fixed")+
+    theme_minimal()
+
+```
+   
+The figure above shows the logarithmic time elapsed of the CPU vs the GPU with different sizes of N (with logarithm in base 2 for better visualization). We observe that an increase of N implies also an increase of time spent by the machine doing its computations, but the host spends more time than the device. Notice that the time and N dimension in this figure is rescaled in a logaritmic way, so actually the improvement of the GPU is greater. We can observe the same thing when the we fix T and let N vary:
+
+```{r echo=FALSE, out.width = "80%", fig.align = "center", message=FALSE, warning=FALSE}
+df3 <- data.frame(log(Elapsed_Time_CPU_Tfix), log(Elapsed_Time_GPU_Tfix), N_Tfix)
+df4 <- melt(df3, id.vars='N_Tfix')
+
+ggplot(df4, aes(x=log2(N_Tfix), y=value, fill=variable)) +
+    geom_bar(stat='identity', position='dodge')+
+    xlab("Log(N) in base 2") + 
+    ylab("log Time elapsed") + 
+    ggtitle("Execution times CPU vs GPU T fixed")+
+    theme_minimal()
+```
+
+Finally, the following two figures show performances as a ratio between GPU and CPU:
+   
+```{r echo=FALSE, out.width = "80%", fig.align = "center", message=FALSE, warning=FALSE}
+
+df1 <- data.frame(ratio_CPU_GPU_Nfix, T_step_Nfix)
+
+ggplot(df1, aes(x=log2(T_step_Nfix), y=ratio_CPU_GPU_Nfix)) +
+    geom_bar(stat='identity', position='dodge')+
+    xlab("Time step increase") + 
+    ylab("Improvement ratio GPU over CPU") + 
+    ggtitle("Improvement growth with N fixed")+
+    theme_minimal()
+
+df2 <- data.frame(ratio_CPU_GPU_Tfix, N_Tfix)
+
+ggplot(df2, aes(x=log2(N_Tfix), y=ratio_CPU_GPU_Tfix)) +
+    geom_bar(stat='identity', position='dodge')+
+    xlab("Number of points N increase") + 
+    ylab("Improvement ratio GPU over CPU") + 
+    ggtitle("Improvement growth with T")+
+    theme_minimal()
+
+```
+   
+The last figure quantifies the improvement of the device over the host while Time step (T) increases. We observe a logaritmic-like improvement over T, where seems that the performance won't increase much more than 14x times approximately, but a further analysis has to be done in order to find the maximum increase of performance. The same pattern appears when whe fix T and we increase the number of points of the metal bar (N), the maximum improvement we have obtained for this experiment was 18x but like the case where N is fixed, a more detailed analysis has to be done in order to find the limit for the improvement. 
+   
+This improvement was expected since the GPU is able to perform more computations than the CPU per second. This is because they are able to execute hundreds of thousands of threads of execution simultaneously, while the CPU computing units are usually made for high-level control tasks, and for inherently sequential algorithms. However, at some point when the complexity is high enough the ratio of improvement GPU over CPU remains constant because both device and host have achieved the maximum work load.
+  
+## Graphic visualization 
+
+Once we have done the time analysis of the GPU over the CPU using information about perf stat and time execution of the program, now is time to take a look at the visual profiler using Gantt Diagram. This diagram provides information about the time spent in each part of the execution, such as memory copies from host to device and viceversa or computation steps. For this part we took a look at a case wich had the following parameters : ($T = 100$ $N = 10e7$ $L = 0.001234$)
+
+
+```{r echo=FALSE,out.width = "80%", fig.align = "center"}
+knitr::include_graphics('100_10e7_heattransfer.png')
+knitr::include_graphics('100_10e7_heattransfer_zoom.png')
+```
+
+We can observe that for this case, the program spends too much time initialising and ending tasks, and there is some relevant time copying data from device to host. If we take a closer look, we observe how the memcopy from host to device presents an irregular pattern. 
+After this, the task is performed in two different parts. We can distinguish bettween the clauses in lines 64 and 68, which correspond to the computation of the stencil, and the clauses in lines 79 and 92, which correspond to the computation of S. Notice this two steps take almost the same amount of time.
+Also, we can observe two other traces in lines 80 and 93, which correspond to the implicit reduction by the kernel when S is computed.
+   
+Notice how the execution of the kernels present a "stairs-like" shape. This is because all kernels are inside an if clause, which depend on the value of t. The ideal case would be that all kernels execute in a parallel way, or at least, without having these huge gaps in between. 
+   
+The first advice we can observe is shown in the **results** visualization below, which tell us the following: First, there is a low memcpy/compute overlap, which means there are too much copies from the host to the device compared with the computation time. Second, we have low kernel concurrency, which means that we can rewrite the code in order to perform the execution of several kernels together. Third, there is also low memcpy overlap, showing again how the data transmition from host to device could be improved. And finally, there is a low compute utilization, which simply means the computation work load is small. This could be improved increasing the number of iterations in the problem, but if we do so, the time spent for the sbatch to write the traces and analysis files would take too much time.
+ 
+This tool also provides us a detailed analysis of individual kernels. Lets take a look at the kernel corresponding to the computation of U2, which takes place at line 64:
+    
+```{r echo=FALSE,out.width = "80%", fig.align = "center"}
+knitr::include_graphics('kernel_1_analysis.png')
+```
+    
+The figure above shows how the memory of the device is too much used. The bar chart shows how the computation part is mainly divided in arithmetic operations and memory operations. In an ideal case, the device should be only performing arithmetic operations. Also we can read what the tool says: *Kernel Performance is bound by memory bandwigth*, which means that in this step the kernel is limited by the memory accesses. 
+   
+If we also take a look at the kernel corresponding to the computation of the first checksum (S), we observe the following:
+
+```{r echo=FALSE,out.width = "80%", fig.align = "center"}
+
+knitr::include_graphics('kernel_2_analysis.png')
+```
+   
+In this case, the compute utilization is higher than the last one, but again we have some troubles with memory. Now the problem is the latency, this means that the performance of this kernel is limited not by the accesses to the memory but the time spent while the kernel ask to the memory for receiving the input it should be computed.
+
+All in all, it seems that this program could be improved if we change the kernels for other ones that deal with the memory and arithmetic operations in a better way. Also, there are other modifications we could implement in the code, such as avoiding time blocking, or rewritting the code in more efficient way.
+   
+
+#4. Conclusions
+
+In this assignment we have learnt how to parallelize two algorithms using the GPU. In both we can see a time performance improvement when increasing the complexity of the algorithms by increasing the sizes of the problem. Actually, the more independent loops are in the algorithm, the more improvement we get when parallelizing into GPU, given the advantage the GPU over CPU in high frequency tasks. However, size of our problems wheren't big enough to appreciate the full potential of GPU parallelization, because in both cases there is more time spent in opening and closing CUDA than time spent in the main body of both algorithms. 
+Also we want to add that we didn't add any modifications to the program but the necessaries in order to include the openACC directives. So we would expect to get a better performance if we add those modifications or if we rewrite the code in a more efficient way.
+
+
+
+
+
+
